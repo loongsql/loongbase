@@ -1,0 +1,421 @@
+/* Copyright (c) 2024 LoongSQL, Inc.
+
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License, version 2.0,
+  as published by the Free Software Foundation.
+
+  This program is also distributed with certain software (including
+  but not limited to OpenSSL) that is licensed under separate terms,
+  as designated in a particular file or component or in included license
+  documentation.  The authors of MySQL hereby grant you an additional
+  permission to link the program and your derivative works with the
+  separately licensed software that they have included with MySQL.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License, version 2.0, for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program; if not, write to the Free Software
+  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+
+// StreamLogControl.cpp: implementation of the StreamLogControl class.
+//
+//////////////////////////////////////////////////////////////////////
+
+#include <stdio.h>
+#include "Engine.h"
+#include "StreamLogControl.h"
+#include "StreamLogWindow.h"
+#include "StreamLogTransaction.h"
+#include "SQLError.h"
+#include "Log.h"
+#include "Dbb.h"
+
+namespace Changjiang {
+
+#define GET_BYTE ((input < inputEnd) ? *input++ : getByte())
+
+//////////////////////////////////////////////////////////////////////
+// Construction/Destruction
+//////////////////////////////////////////////////////////////////////
+
+StreamLogControl::StreamLogControl(StreamLog *streamLog) {
+  log = streamLog;
+  inputWindow = NULL;
+  debug = false;
+  singleBlock = false;
+  lastCheckpoint = 0;
+  records[0] = NULL;
+  version = (streamLog->recovering) ? 0 : srlCurrentVersion;
+
+  for (int n = 1; n < srlMax; ++n) {
+    StreamLogRecord *manager = getRecordManager(n);
+    manager->log = streamLog;
+    manager->control = this;
+    records[n] = manager;
+  }
+}
+
+StreamLogControl::~StreamLogControl() {
+  if (inputWindow) inputWindow->deactivateWindow();
+}
+
+StreamLogRecord *StreamLogControl::getRecordManager(int which) {
+  switch (which) {
+    case srlSwitchLog:
+      return &switchLog;
+
+    case srlCommit:
+      return &commit;
+
+    case srlRollback:
+      return &rollback;
+
+    case srlPrepare:
+      return &prepare;
+
+    case srlDataUpdate:
+      return &dataUpdate;
+
+    case srlDelete:
+      return &deleteData;
+
+    case srlIndexUpdate:
+      return &indexUpdate;
+
+    case srlWordUpdate:
+      return &wordUpdate;
+
+    case srlRecordStub:
+      return &recordStub;
+
+    case srlSequence:
+      return &sequence;
+
+    case srlCheckpoint:
+      return &checkpoint;
+
+    case srlLargBlob:
+      return &largeBlob;
+
+    case srlDropTable:
+      return &dropTable;
+
+    case srlCreateSection:
+      return &createSection;
+
+    case srlSectionPage:
+      return &sectionPage;
+
+    case srlFreePage:
+      return &freePage;
+
+    case srlRecordLocator:
+      return &recordLocator;
+
+    case srlDataPage:
+      return &dataPage;
+
+    case srlIndexAdd:
+      return &indexAdd;
+
+    case srlIndexDelete:
+      return &indexDelete;
+
+    case srlIndexPage:
+      return &indexPage;
+
+    case srlInversionPage:
+      return &inversionPage;
+
+    case srlCreateIndex:
+      return &createIndex;
+
+    case srlDeleteIndex:
+      return &deleteIndex;
+
+    case srlVersion:
+      return &logVersion;
+
+    case srlUpdateRecords:
+      return &updateRecords;
+
+    case srlUpdateIndex:
+      return &updateIndex;
+
+    case srlSequencePage:
+      return &sequencePage;
+
+    case srlSectionPromotion:
+      return &sectionPromotion;
+
+    case srlSectionLine:
+      return &sectionLine;
+
+    case srlOverflowPages:
+      return &overflowPages;
+
+    case srlCreateTableSpace:
+      return &createTableSpace;
+
+    case srlDropTableSpace:
+      return &dropTableSpace;
+
+    case srlBlobDelete:
+      return &blobDelete;
+
+    case srlSession:
+      return &session;
+
+    case srlSmallBlob:
+      return &smallBlob;
+
+    case srlSavepointRollback:
+      return &savepointRollback;
+
+    case srlInventoryPage:
+      return &inventoryPage;
+
+    case srlTableSpaces:
+      return &tableSpaces;
+
+    default:
+      ASSERT(false);
+  }
+}
+
+void StreamLogControl::setWindow(StreamLogWindow *window, StreamLogBlock *block,
+                                 int offset) {
+  // ASSERT(window->validate(block));
+  //  StreamLogWindow *priorWindow = inputWindow;
+  //  StreamLogBlock *priorBlock = inputBlock;
+  // ASSERT(!priorWindow || priorWindow->validate(priorBlock));
+
+  if (inputWindow != window) {
+    if (inputWindow) inputWindow->deactivateWindow();
+
+    if ((inputWindow = window)) inputWindow->activateWindow(true);
+  }
+
+  Sync sync(&log->syncWrite, "StreamLogControl::setWindow");
+  sync.lock(Shared);
+  // inputWindow->validate(block);
+  // ASSERT(inputWindow->validate(block));
+  inputBlock = block;
+  input = inputBlock->data;
+  inputEnd = (const UCHAR *)inputBlock + block->length;
+  version = inputBlock->version;
+  singleBlock = false;
+
+  if (inputBlock == log->writeBlock && log->recordIncomplete)
+    inputEnd = log->recordStart;
+
+  // ASSERT(inputWindow->validate(inputEnd));
+  version = srlVersion0;
+
+  if (input < inputEnd) {
+    int type = getInt();
+
+    if (type == srlVersion) version = getInt();
+  }
+
+  // ASSERT(version == srlCurrentVersion);
+  input = inputBlock->data + offset;
+}
+
+int StreamLogControl::getInt() {
+  UCHAR c = GET_BYTE;
+  int number = (c & 0x40) ? -1 : 0;
+
+  for (;;) {
+    number = (number << 7) | (c & 0x7f);
+
+    if (c & LOW_BYTE_FLAG) break;
+
+    c = GET_BYTE;
+  }
+
+  return number;
+}
+
+UCHAR StreamLogControl::getByte() {
+  if (input < inputEnd) return *input++;
+
+  uint64 blockNumber = inputBlock->blockNumber + 1;
+  StreamLogBlock *block = inputWindow->nextBlock(inputBlock);
+
+  if (block) {
+    ASSERT(block->blockNumber == blockNumber);
+    // validate(inputWindow, block);
+    setWindow(inputWindow, block, 0);
+  } else {
+    StreamLogWindow *window;
+
+    if (inputWindow && inputWindow->next &&
+        inputWindow->next->firstBlockNumber == blockNumber)
+      window = inputWindow->next;
+    else
+      window = log->findWindowGivenBlock(blockNumber);
+
+    if (!window) {
+      Log::debug("Can't find stream log block " I64FORMAT "\n", blockNumber);
+      log->printWindows();
+
+      throw SQLError(LOG_ERROR, "Serial log overrun");
+    }
+
+    window->activateWindow(true);
+    // validate(window, window->firstBlock());
+    setWindow(window, window->firstBlock(), 0);
+    ASSERT(inputBlock->blockNumber == blockNumber);
+    window->deactivateWindow();
+  }
+
+  if (log->recoveryPhase == 2 && blockNumber == lastCheckpoint &&
+      log->tracePage)
+    Log::debug("*** Checkpoint block ***\n");
+
+  if (debug)
+    Log::debug("\nProcessing stream log block " I64FORMAT
+               ", read block " I64FORMAT "\n\n",
+               blockNumber, inputBlock->readBlockNumber);
+
+  return *input++;
+}
+
+bool StreamLogControl::atEnd() {
+  if (input < inputEnd) return false;
+
+  if (singleBlock) return true;
+
+  StreamLogBlock *block = inputWindow->nextBlock(inputBlock);
+
+  if (block) return false;
+
+  StreamLogWindow *window =
+      log->findWindowGivenBlock(inputBlock->blockNumber + 1);
+
+  if (window) return false;
+
+  return true;
+}
+
+StreamLogRecord *StreamLogControl::nextRecord() {
+  if (atEnd()) return NULL;
+
+  ASSERT(*input >= (LOW_BYTE_FLAG | srlEnd) &&
+         *input < (LOW_BYTE_FLAG | srlMax));
+  recordStart = input;
+  UCHAR type = getInt();
+
+  while ((type == srlEnd)) {
+    if (debug)
+      Log::debug("Recovery %s\n", (type == srlEnd) ? "end" : "version");
+
+    if (atEnd()) return NULL;
+
+    // As of srlVersion1, each srl record starts with a srlVersion.
+
+    if (type == srlVersion) version = getInt();
+
+    recordStart = input;
+    type = getInt();
+  }
+
+  ASSERT(version > 0);
+  ASSERT(type < srlMax);
+  StreamLogRecord *record = records[type];
+  record->type = type;
+  record->read();
+
+  if (debug) record->print();
+
+  return record;
+}
+
+const UCHAR *StreamLogControl::getData(int length) {
+  ASSERT(length >= 0);
+
+  if (input + length > inputEnd)
+    throw SQLError(LOG_ERROR, "data overrun in stream log");
+
+  const UCHAR *data = input;
+  input += length;
+
+  return data;
+}
+
+StreamLogTransaction *StreamLogControl::getTransaction(TransId transactionId) {
+  StreamLogTransaction *transaction = log->findTransaction(transactionId);
+
+  if (transaction) return transaction;
+
+  transaction = log->getTransaction(transactionId);
+  transaction->setStart(recordStart, inputBlock, inputWindow);
+
+  return transaction;
+}
+
+int StreamLogControl::getOffset() {
+  return (int)(input - (const UCHAR *)inputBlock);
+}
+
+uint64 StreamLogControl::getBlockNumber() { return inputBlock->blockNumber; }
+
+void StreamLogControl::validate(StreamLogWindow *window,
+                                StreamLogBlock *block) {
+  setWindow(window, block, 0);
+
+  for (;;) {
+    if (atEnd()) return;
+
+    ASSERT(*input >= (LOW_BYTE_FLAG | srlEnd) &&
+           *input < (LOW_BYTE_FLAG | srlMax));
+    recordStart = input;
+    UCHAR type = getInt();
+
+    while (type == srlEnd) {
+      ASSERT((uint32)(input - (UCHAR *)inputBlock) == inputBlock->length);
+      return;
+    }
+
+    StreamLogRecord *record = getRecordManager(type);
+    record->read();
+  }
+}
+
+/***
+void StreamLogControl::setVersion(int newVersion)
+{
+        version = newVersion;
+}
+***/
+
+void StreamLogControl::fini(void) {
+  if (inputWindow) {
+    inputWindow->deactivateWindow();
+    inputWindow = NULL;
+  }
+}
+
+void StreamLogControl::printBlock(StreamLogBlock *block) {
+  setWindow(NULL, block, 0);
+  Log::debug(
+      "Stream Log Block " I64FORMAT ", length %d, read block " I64FORMAT "\n",
+      inputBlock->blockNumber, inputBlock->length, inputBlock->readBlockNumber);
+  singleBlock = true;
+
+  for (StreamLogRecord *record; (record = nextRecord());) record->print();
+}
+
+void StreamLogControl::haveCheckpoint(int64 blockNumber) {
+  lastCheckpoint = (blockNumber) ? blockNumber : inputBlock->blockNumber;
+}
+
+bool StreamLogControl::isPostFlush(void) {
+  return inputBlock->blockNumber > lastCheckpoint;
+}
+
+}  // namespace Changjiang
